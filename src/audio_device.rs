@@ -1,25 +1,38 @@
+use log::{error, info};
+use std::os::windows::process::CommandExt; // Import the extension trait
+use std::process::Command; // Import logging macros
+// use windows::core; // Keep commented unless needed elsewhere
+// use windows::core::{GUID, PCWSTR}; // Remove unused GUID, PCWSTR
+use windows::Win32::System::Com::StructuredStorage::PropVariantClear;
+// Import PCWSTR for wide strings
 use windows::{
-    core::{Result, PWSTR, HSTRING},
     Win32::{
-        Foundation::SysAllocStringLen,
+        Foundation::PROPERTYKEY,
+        // Foundation::SysAllocStringLen, // Removed unused import
         Media::Audio::{
-            eRender, eConsole, eCommunications, // Specify rendering devices and roles
-            IMMDeviceEnumerator, MMDeviceEnumerator, // Device enumerator
-            IMMDeviceCollection, IMMDevice, IMMEndpoint, // Device interfaces
             DEVICE_STATE_ACTIVE, // Filter for active devices
-            ERole, // Enum for device roles
+            // ERole,               // Removed - No longer needed
+            IMMDevice, // Removed unused IMMEndpoint
+            IMMDeviceCollection,
+            IMMDeviceEnumerator,
+            MMDeviceEnumerator, // Device enumerator
+            // eCommunications,    // Removed - No longer needed
+            // eConsole,           // Removed - No longer needed
+            eRender,
+            eCapture, // Added for input devices
         },
         System::Com::{
-            CoInitializeEx, CoUninitialize, CoCreateInstance,
-            CLSCTX_ALL, COINIT_MULTITHREADED, // COM initialization flags
-            IUnknown, // Base COM interface
+            CLSCTX_ALL,
+            COINIT_MULTITHREADED, // COM initialization flags
+            // IUnknown, // Moved to windows::core
+            CoCreateInstance,
+            CoInitializeEx,
+            CoUninitialize,
         },
-        UI::Shell::PropertiesSystem::{IPropertyStore, PROPERTYKEY}, // For device properties
+        UI::Shell::PropertiesSystem::IPropertyStore, // For device properties
     },
-};
-use windows::core::{Interface, GUID, HRESULT, PCWSTR}; // Import PCWSTR for wide strings
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt; // For converting &str to wide strings
+    core::{PWSTR, Result}, // Keep Result for list_output_devices
+}; // For converting &str to wide strings
 
 // Define a structure to hold device information
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,15 +51,17 @@ const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
 pub fn list_output_devices() -> Result<Vec<AudioDevice>> {
     unsafe {
         // Initialize COM for this thread
-        CoInitializeEx(None, COINIT_MULTITHREADED)?; // Use multithreaded apartment
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED); // Use multithreaded apartment
 
         let mut devices = Vec::new();
 
         // Create an instance of the device enumerator
-        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
         // Get the collection of active rendering devices
-        let collection: IMMDeviceCollection = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
+        let collection: IMMDeviceCollection =
+            enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
 
         let count = collection.GetCount()?;
 
@@ -57,7 +72,8 @@ pub fn list_output_devices() -> Result<Vec<AudioDevice>> {
             windows::Win32::System::Com::CoTaskMemFree(Some(id_pwstr.as_ptr() as *mut _)); // Free the memory allocated by GetId
 
             // Get the property store for the device
-            let properties: IPropertyStore = device.OpenPropertyStore(windows::Win32::System::Com::STGM_READ)?;
+            let properties: IPropertyStore =
+                device.OpenPropertyStore(windows::Win32::System::Com::STGM_READ)?;
 
             // Get the friendly name property
             let prop_variant = properties.GetValue(&PKEY_DEVICE_FRIENDLY_NAME)?;
@@ -65,14 +81,23 @@ pub fn list_output_devices() -> Result<Vec<AudioDevice>> {
             // Extract the string value (PWSTR) from the PROPVARIANT
             // prop_variant.Anonymous.Anonymous.vt holds the type, should be VT_LPWSTR
             // prop_variant.Anonymous.Anonymous.Anonymous holds the data
-            let name = if prop_variant.Anonymous.Anonymous.vt == windows::Win32::System::Variant::VT_LPWSTR {
-                 prop_variant.Anonymous.Anonymous.Anonymous.pwszVal.to_string().unwrap_or_else(|_| "Invalid Name".to_string())
+            let name = if prop_variant.Anonymous.Anonymous.vt
+                == windows::Win32::System::Variant::VT_LPWSTR
+            {
+                prop_variant
+                    .Anonymous
+                    .Anonymous
+                    .Anonymous
+                    .pwszVal
+                    .to_string()
+                    .unwrap_or_else(|_| "Invalid Name".to_string())
             } else {
                 "Unknown Name".to_string()
             };
 
             // Important: Need to free the PROPVARIANT memory
-            windows::Win32::System::Variant::PropVariantClear(&prop_variant)?;
+            // PropVariantClear is often in Com::StructuredStorage or just Com
+            PropVariantClear((&prop_variant) as *const _ as *mut _)?;
 
             if !id.is_empty() && name != "Unknown Name" && name != "Invalid Name" {
                 devices.push(AudioDevice { id, name });
@@ -86,81 +111,223 @@ pub fn list_output_devices() -> Result<Vec<AudioDevice>> {
     }
 }
 
+/// Enumerates active audio input (capture) devices.
+pub fn list_input_devices() -> Result<Vec<AudioDevice>> {
+    unsafe {
+        // Initialize COM for this thread
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED); // Use multithreaded apartment
 
-// --- Undocumented COM Interface: IPolicyConfigVista ---
-// Found via reverse engineering / online resources. Use with caution.
-#[repr(C)]
-struct IPolicyConfigVistaVtbl {
-    parent: windows::core::IUnknown_Vtbl,
-    get_mixing_format: usize, // Placeholder, not used
-    get_device_format: usize, // Placeholder, not used
-    reset_device_format: usize, // Placeholder, not used
-    set_device_format: usize, // Placeholder, not used
-    get_processing_period: usize, // Placeholder, not used
-    set_processing_period: usize, // Placeholder, not used
-    get_share_mode: usize, // Placeholder, not used
-    set_share_mode: usize, // Placeholder, not used
-    get_property_value: usize, // Placeholder, not used
-    set_property_value: usize, // Placeholder, not used
-    set_default_endpoint: unsafe extern "system" fn(
-        this: *mut IPolicyConfigVista,
-        device_id: PCWSTR,
-        role: ERole,
-    ) -> HRESULT,
-    set_endpoint_visibility: usize, // Placeholder, not used
-}
+        let mut devices = Vec::new();
 
-#[windows::core::interface("568b9108-44bf-40b4-9006-86afe5b5a680")] // IID_IPolicyConfigVista
-unsafe trait IPolicyConfigVista: IUnknown {
-    unsafe fn set_default_endpoint(&self, device_id: PCWSTR, role: ERole) -> Result<()>;
-}
+        // Create an instance of the device enumerator
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
-// Implement the trait method using the VTable pointer
-impl IPolicyConfigVista {
-    unsafe fn set_default_endpoint(&self, device_id: PCWSTR, role: ERole) -> Result<()> {
-        let this = self as *const *const IPolicyConfigVistaVtbl;
-        let this = *this; // Dereference to get the VTable pointer
-        let vtbl = &*(*this); // Dereference to get the VTable struct
-        (vtbl.set_default_endpoint)(this as *mut _, device_id, role).ok()
+        // Get the collection of active capture devices
+        let collection: IMMDeviceCollection =
+            enumerator.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)?;
+
+        let count = collection.GetCount()?;
+
+        for i in 0..count {
+            let device: IMMDevice = collection.Item(i)?;
+            let id_pwstr: PWSTR = device.GetId()?;
+            let id = id_pwstr.to_string().unwrap_or_default(); // Convert PWSTR to String
+            windows::Win32::System::Com::CoTaskMemFree(Some(id_pwstr.as_ptr() as *mut _)); // Free the memory allocated by GetId
+
+            // Get the property store for the device
+            let properties: IPropertyStore =
+                device.OpenPropertyStore(windows::Win32::System::Com::STGM_READ)?;
+
+            // Get the friendly name property
+            let prop_variant = properties.GetValue(&PKEY_DEVICE_FRIENDLY_NAME)?;
+
+            // Extract the string value (PWSTR) from the PROPVARIANT
+            let name = if prop_variant.Anonymous.Anonymous.vt
+                == windows::Win32::System::Variant::VT_LPWSTR
+            {
+                prop_variant
+                    .Anonymous
+                    .Anonymous
+                    .Anonymous
+                    .pwszVal
+                    .to_string()
+                    .unwrap_or_else(|_| "Invalid Name".to_string())
+            } else {
+                "Unknown Name".to_string()
+            };
+
+            // Important: Need to free the PROPVARIANT memory
+            PropVariantClear((&prop_variant) as *const _ as *mut _)?;
+
+            if !id.is_empty() && name != "Unknown Name" && name != "Invalid Name" {
+                devices.push(AudioDevice { id, name });
+            }
+        }
+
+        // Uninitialize COM
+        CoUninitialize();
+
+        Ok(devices)
     }
 }
 
-// CLSID_PolicyConfigClient
-const POLICY_CONFIG_CLIENT: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+// --- Undocumented COM Interface Definitions Removed ---
 
-
-/// Sets the default audio output device for Console (Multimedia) and Communications roles.
+/// Sets the default audio output device using PowerShell's Set-AudioDevice cmdlet.
 ///
 /// # Arguments
 /// * `device_id` - The unique ID string of the device to set as default.
 ///
-/// # Safety
-/// This function uses undocumented Windows COM interfaces (`IPolicyConfigVista`).
-/// It might break in future Windows updates.
-pub fn set_default_output_device(device_id: &str) -> Result<()> {
-    unsafe {
-        CoInitializeEx(None, COINIT_MULTITHREADED)?;
+/// # Notes
+/// - Requires PowerShell 5.1 or later.
+/// - May require the user to install the `AudioDeviceCmdlets` module:
+///   `Install-Module -Name AudioDeviceCmdlets -Scope CurrentUser`
+/// - Hides the PowerShell window during execution.
+// Use standard library Result and Box<dyn Error> for flexibility
+pub fn set_default_output_device(
+    device_id: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let escaped_device_id = device_id.replace('\'', "''");
 
-        // Convert the device ID string to a wide string (PCWSTR)
-        let wide_device_id: Vec<u16> = OsStr::new(device_id)
-            .encode_wide()
-            .chain(std::iter::once(0)) // Null-terminate
-            .collect();
-        let pcwstr_device_id = PCWSTR::from_raw(wide_device_id.as_ptr());
+    // --- Get path to bundled module manifest ---
+    let mut module_manifest_path = std::env::current_exe()
+        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+    module_manifest_path.pop(); // Remove executable name
+    module_manifest_path.push("modules");
+    module_manifest_path.push("AudioDeviceCmdlets");
+    module_manifest_path.push("AudioDeviceCmdlets.psd1"); // Directly point to the manifest
 
-        // Create an instance of the PolicyConfigClient
-        // We expect an IPolicyConfigVista interface pointer back
-        let policy_config: IPolicyConfigVista = CoCreateInstance(
-            &POLICY_CONFIG_CLIENT,
-            None,
-            CLSCTX_ALL, // Request an in-process server
-        )?;
+    // Check if the constructed path actually exists before proceeding
+    if !module_manifest_path.exists() {
+        return Err(format!("Bundled module manifest not found at expected path: {}", module_manifest_path.display()).into());
+    }
 
-        // Set the default device for both Console and Communications roles
-        policy_config.set_default_endpoint(pcwstr_device_id, eConsole)?;
-        policy_config.set_default_endpoint(pcwstr_device_id, eCommunications)?;
+    let module_path_str = module_manifest_path.to_str()
+        .ok_or("Failed to convert module path to string")?;
+    // Escape path for PowerShell command
+    let escaped_module_path = module_path_str.replace('\'', "''");
+    // --- End get path ---
 
-        CoUninitialize();
+
+    // Construct the PowerShell command: Import using full path, then run Set-AudioDevice
+    let command_str = format!(
+        // Use single quotes around the path in PowerShell
+        "Import-Module -Name '{}' -ErrorAction Stop; Set-AudioDevice -ID '{}'",
+        escaped_module_path,
+        escaped_device_id
+    );
+
+    info!("Executing PowerShell: {}", command_str); // Log info
+
+    // Execute the command using powershell.exe
+    const CREATE_NO_WINDOW: u32 = 0x08000000; // Define flag to hide window
+    let output = Command::new("powershell.exe")
+        .creation_flags(CREATE_NO_WINDOW) // Set the flag to prevent window creation
+        // Arguments to hide window and run command
+        .args(&[
+            "-NoProfile",      // Don't load user profile
+            "-NonInteractive", // Don't require user interaction
+            "-WindowStyle", "Hidden", // Hide the window
+            "-Command", &command_str, // Use the new command string
+        ])
+        .output() // Capture stdout/stderr/status
+        .map_err(|e| format!("Failed to execute PowerShell command: {}", e))?; // This ? now works with Box<dyn Error>
+
+    // Check the exit status
+    if output.status.success() {
+        info!("PowerShell command succeeded."); // Log info
         Ok(())
+    } else {
+        // Combine stdout and stderr for error message
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let err_msg = format!(
+            "PowerShell command failed with status: {}. Stdout: '{}'. Stderr: '{}'",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        );
+        error!("{}", err_msg); // Log error
+        Err(err_msg.into()) // This .into() correctly converts String to Box<dyn Error>
     }
 }
+
+/// Sets the default audio input device using PowerShell's Set-AudioDevice cmdlet.
+///
+/// # Arguments
+/// * `device_id` - The unique ID string of the device to set as default input.
+///
+/// # Notes
+/// - Requires PowerShell 5.1 or later.
+/// - May require the user to install the `AudioDeviceCmdlets` module:
+///   `Install-Module -Name AudioDeviceCmdlets -Scope CurrentUser`
+/// - Hides the PowerShell window during execution.
+pub fn set_default_input_device(
+    device_id: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let escaped_device_id = device_id.replace('\'', "''");
+
+    // --- Get path to bundled module manifest ---
+    let mut module_manifest_path = std::env::current_exe()
+        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+    module_manifest_path.pop(); // Remove executable name
+    module_manifest_path.push("modules");
+    module_manifest_path.push("AudioDeviceCmdlets");
+    module_manifest_path.push("AudioDeviceCmdlets.psd1"); // Directly point to the manifest
+
+    // Check if the constructed path actually exists before proceeding
+    if !module_manifest_path.exists() {
+        return Err(format!("Bundled module manifest not found at expected path: {}", module_manifest_path.display()).into());
+    }
+
+    let module_path_str = module_manifest_path.to_str()
+        .ok_or("Failed to convert module path to string")?;
+    // Escape path for PowerShell command
+    let escaped_module_path = module_path_str.replace('\'', "''");
+    // --- End get path ---
+
+    // Construct the PowerShell command: Import using full path, then run Set-AudioDevice with -RecordingDevice flag
+    let command_str = format!(
+        // Use single quotes around the path in PowerShell
+        "Import-Module -Name '{}' -ErrorAction Stop; Set-AudioDevice -ID '{}' -RecordingDevice",
+        escaped_module_path,
+        escaped_device_id
+    );
+
+    info!("Executing PowerShell for input device: {}", command_str); // Log info
+
+    // Execute the command using powershell.exe
+    const CREATE_NO_WINDOW: u32 = 0x08000000; // Define flag to hide window
+    let output = Command::new("powershell.exe")
+        .creation_flags(CREATE_NO_WINDOW) // Set the flag to prevent window creation
+        // Arguments to hide window and run command
+        .args(&[
+            "-NoProfile",      // Don't load user profile
+            "-NonInteractive", // Don't require user interaction
+            "-WindowStyle", "Hidden", // Hide the window
+            "-Command", &command_str, // Use the new command string
+        ])
+        .output() // Capture stdout/stderr/status
+        .map_err(|e| format!("Failed to execute PowerShell command for input device: {}", e))?;
+
+    // Check the exit status
+    if output.status.success() {
+        info!("PowerShell command for input device succeeded."); // Log info
+        Ok(())
+    } else {
+        // Combine stdout and stderr for error message
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let err_msg = format!(
+            "PowerShell command for input device failed with status: {}. Stdout: '{}'. Stderr: '{}'",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        );
+        error!("{}", err_msg); // Log error
+        Err(err_msg.into()) // This .into() correctly converts String to Box<dyn Error>
+    }
+}
+
+// Removed unused helper function find_module_manifest

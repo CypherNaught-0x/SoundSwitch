@@ -1,0 +1,23 @@
+# Set to true to enable fuzzy matching for device names, false for exact matching.
+fuzzy_match = true
+
+# Define your hotkey mappings here.
+# 'keys' uses a format like "Modifier+Modifier+Key" (e.g., "Ctrl+Shift+F1", "Alt+1").
+# Supported modifiers: Ctrl, Alt, Shift, Win (Super/Meta).
+# See the 'global_hotkey' crate documentation for specific key names.
+# 'device-name' is the friendly name of the audio output device as shown in Windows Sound settings.
+# 'input-device-name' (optional) is the friendly name of the audio input device to switch to automatically.
+[[hotkeys]]
+keys = "Ctrl+Alt+1"
+device-name = "Speakers (Realtek High Definition Audio)"
+input-device-name = "Microphone (Realtek High Definition Audio)"
+
+[[hotkeys]]
+keys = "Ctrl+Alt+2"
+device-name = "Headset (HyperX Cloud II Wireless)"
+input-device-name = "Microphone (HyperX Cloud II Wireless)"
+
+[[hotkeys]]
+keys = "Ctrl+Alt+F4"
+device-name = "DELL U2719DC (NVIDIA High Definition Audio)"
+# No input device specified - only switches output device

@@ -6,12 +6,27 @@ edition = "2024"
 [dependencies]
 toml = "0.8" # For TOML configuration file parsing
 serde = { version = "1.0", features = ["derive"] } # For serialization/deserialization
-windows = { version = "0.56", features = [
+windows = { version = "0.61.1", features = [
     "Win32_Media_Audio",        # Core Audio APIs (IMMDeviceEnumerator, etc.)
     "Win32_System_Com",         # COM initialization (CoInitializeEx, etc.)
     "Win32_Foundation",         # Basic Windows types (HANDLE, BOOL, etc.)
     "Win32_UI_WindowsAndMessaging", # Needed for message loops potentially used by tray/hotkeys
+    "Win32_UI_Shell",               # For IPropertyStore, PROPERTYKEY
+    "Win32_System_Variant",         # For VT_LPWSTR
+    "Win32_UI_Shell_PropertiesSystem", # For IPropertyStore, PROPERTYKEY
+    "Win32_System_Com_StructuredStorage", # For PropVariantClear
 ]} # Windows API bindings
-global_hotkey = "0.4" # Global hotkey registration
+global-hotkey = "0.6.4" # Global hotkey registration
 fuzzy-matcher = "0.3" # Fuzzy string matching
-tray-item = "0.8" # System tray icon
+tray-item = "0.10.0" # System tray icon
+windows-core = "0.61.0"
+crossbeam-channel = "0.5.15"
+simplelog = "0.12"
+log = "0.4.27"
+
+[build-dependencies]
+embed-resource = "3.0.2" # Or the latest version
+
+simplelog = "0.12" # Or latest version
+
+fs_extra = "1.3" # For copying directories in build script

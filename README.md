@@ -5,14 +5,20 @@ A simple Rust application for Windows that allows switching the default audio ou
 ## Features
 
 *   **Global Hotkeys:** Define custom key combinations to switch to specific audio devices.
-*   **Configurable Devices:** Map hotkeys to target audio device names in a configuration file.
+*   **Configurable Devices:** Map hotkeys to target audio output device names in a configuration file.
+*   **Auto Input Switching:** Optionally map hotkeys to also switch the default input device automatically.
+*   **Device Validation:** Shows a notification on startup if any configured devices are not found.
 *   **Fuzzy Matching:** Optionally enable fuzzy matching for device names if the exact name isn't known or contains variable elements.
 *   **Background Operation:** Runs silently in the background with a system tray icon.
 *   **System Tray Control:** Provides a "Quit" option in the system tray menu to cleanly exit the application.
 
 ## Configuration
 
-The application requires a `config.toml` file located in the same directory as the executable (`sound_switch.exe`).
+The application requires a `config.toml` file. It looks for the config file in this order:
+1. Next to the executable (`sound_switch.exe`)
+2. In the current working directory
+
+If no config file is found, the application will show an error message with the exact paths it searched.
 
 **Example `config.toml`:**
 
@@ -24,22 +30,26 @@ fuzzy_match = true
 # 'keys' uses a format like "Modifier+Modifier+Key" (e.g., "Ctrl+Shift+F1", "Alt+1").
 # Supported modifiers: Ctrl, Alt, Shift, Win (Super/Meta).
 # See the 'global_hotkey' crate documentation for specific key names.
-# 'device' is the friendly name of the audio output device as shown in Windows Sound settings.
+# 'device-name' is the friendly name of the audio output device as shown in Windows Sound settings.
+# 'input-device-name' (optional) is the friendly name of the audio input device to switch to automatically.
 [[hotkeys]]
 keys = "Ctrl+Alt+1"
-device = "Speakers (Realtek High Definition Audio)"
+device-name = "Speakers (Realtek High Definition Audio)"
+input-device-name = "Microphone (Realtek High Definition Audio)"
 
 [[hotkeys]]
 keys = "Ctrl+Alt+2"
-device = "Headset (HyperX Cloud II Wireless)"
+device-name = "Headset (HyperX Cloud II Wireless)"
+input-device-name = "Microphone (HyperX Cloud II Wireless)"
 
 [[hotkeys]]
 keys = "Ctrl+Alt+F4"
-device = "DELL U2719DC (NVIDIA High Definition Audio)"
+device-name = "DELL U2719DC (NVIDIA High Definition Audio)"
+# No input device specified - only switches output device
 ```
 
 **Finding Device Names:**
-You can find the exact names of your audio output devices in the Windows Sound settings panel.
+You can find the exact names of your audio output and input devices in the Windows Sound settings panel. Both output and input device names are shown in their respective sections.
 
 ## Building
 

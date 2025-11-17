@@ -1,1 +1,5 @@
 /target
+InstallerOutput/
+*.log
+*.iss
+config.toml

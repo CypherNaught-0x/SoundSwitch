@@ -1,144 +1,224 @@
 // Only show console window in debug builds
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use simplelog::*;
 use std::error::Error;
-use std::collections::HashMap;
-use std::sync::mpsc::{channel, Receiver as MpscReceiver}; // Renamed to avoid conflict
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::fs::File; // For log file creation // Import simplelog macros and types
+// use std::collections::HashMap; // Removed unused import
+// use std::sync::mpsc::{channel, Receiver as MpscReceiver}; // Keep commented
+use crossbeam_channel; // Restore
+use log::{error, info, warn};
+use std::sync::Arc; // Restore
+use std::sync::atomic::{AtomicBool, Ordering}; // Restore
 use std::thread;
-use std::time::Duration; // For polling sleep
+use std::time::Duration; // Keep for sleep // Import log macros
 
 mod audio_device;
 mod config;
 mod hotkey_manager;
 
-use audio_device::{list_output_devices, set_default_output_device, AudioDevice};
-use config::{load_config, Config}; // Import Config struct
-use global_hotkey::{GlobalHotKeyEvent, HotKeyState, HotkeyManager}; // Import HotkeyManager
-use hotkey_manager::register_hotkeys;
+use audio_device::{AudioDevice, list_output_devices, list_input_devices, set_default_output_device, set_default_input_device};
+use config::{Config, load_config}; // Import Config struct
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use tray_item::TrayItem; // Import TrayItem
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState}; // Corrected import name
+use hotkey_manager::register_hotkeys;
+use tray_item::TrayItem;
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+};
+use windows_core::BOOL; // Use windows_core::BOOL as suggested by compiler // Restore tray item import
 
 // Enum for messages between threads
 enum AppMessage {
-    HotkeyError(Box<dyn Error + Send>),
+    HotkeyError(String), // Use String for thread safety
     Quit,
 }
 
-// Function to handle hotkey logic in a separate thread
+// Function to handle hotkey logic in a separate thread with a Win32 message loop
 fn hotkey_listener_thread(
     config: Config,
     shutdown_signal: Arc<AtomicBool>,
-    error_sender: std::sync::mpsc::Sender<AppMessage>,
+    error_sender: crossbeam_channel::Sender<AppMessage>,
 ) {
-    println!("Hotkey listener thread started.");
+    info!("Hotkey listener thread started."); // Log info
 
-    // 1. Register Hotkeys (Manager must live in this thread)
-    let manager = match HotkeyManager::new() {
+    // Initialize COM for this thread (required by some system APIs)
+    // Revert back to Multi-Threaded Apartment (MTA)
+    let hr = unsafe {
+        windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_MULTITHREADED,
+        )
+    };
+    if hr.is_err() {
+        // Check HRESULT directly
+        let _ = error_sender.send(AppMessage::HotkeyError(format!(
+            "Hotkey thread failed to initialize COM (MTA): {:?}",
+            hr
+        )));
+        return;
+    }
+    info!("Hotkey thread COM initialized."); // Log info
+
+    // 1. Create Hotkey Manager (must live in this thread)
+    let manager = match GlobalHotKeyManager::new() {
         Ok(m) => m,
         Err(e) => {
-            let _ = error_sender.send(AppMessage::HotkeyError(Box::new(e)));
+            let _ = error_sender.send(AppMessage::HotkeyError(format!(
+                "Failed to create GlobalHotKeyManager: {}",
+                e
+            )));
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+            return;
+        }
+    };
+    info!("Hotkey manager created in thread."); // Log info
+
+    // 2. Register Hotkeys
+    let (hotkey_device_map, hotkeys) = match register_hotkeys(&manager, &config) {
+        Ok((map, keys)) => {
+            info!("Hotkey registration successful in thread."); // Log info
+            (map, keys)
+        }
+        Err(e) => {
+            error!("Error registering hotkeys in thread: {}", e); // Log error
+            let _ = error_sender.send(AppMessage::HotkeyError(format!(
+                "Failed to register hotkeys: {}",
+                e
+            )));
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
             return;
         }
     };
 
-    let hotkey_device_map = match register_hotkeys(&manager, &config) {
-        Ok(map) => {
-            println!("Hotkey registration successful in thread.");
-            map
-        }
-        Err(e) => {
-            eprintln!("Error registering hotkeys in thread: {}", e);
-            // Send error back to main thread to potentially notify user
-            let _ = error_sender.send(AppMessage::HotkeyError(e));
-            return; // Stop thread if registration fails
-        }
-    };
-
-    // 2. Setup Event Receiver
+    // 3. Get Hotkey Event Receiver
     let receiver = GlobalHotKeyEvent::receiver();
-    println!("Hotkey event listener waiting for events...");
+    info!("Hotkey event listener waiting for events..."); // Log info
 
-    // 3. Get initial list of audio devices
-    let available_devices = match list_output_devices() {
+    // 4. Get initial list of audio devices (both output and input)
+    let available_output_devices = match list_output_devices() {
         Ok(devices) => devices,
         Err(e) => {
-            eprintln!("Fatal: Could not list audio output devices in thread: {}. Exiting thread.", e);
-            let _ = error_sender.send(AppMessage::HotkeyError(e));
+            error!(
+                "Fatal: Could not list audio output devices in thread: {}. Exiting thread.",
+                e
+            ); // Log error
+            let _ = error_sender.send(AppMessage::HotkeyError(format!(
+                "Failed to list audio output devices: {}",
+                e
+            )));
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
             return;
         }
     };
-    println!("Found {} audio devices in thread.", available_devices.len());
+    info!("Found {} audio output devices in thread.", available_output_devices.len()); // Log info
 
+    let available_input_devices = match list_input_devices() {
+        Ok(devices) => devices,
+        Err(e) => {
+            error!(
+                "Fatal: Could not list audio input devices in thread: {}. Exiting thread.",
+                e
+            ); // Log error
+            let _ = error_sender.send(AppMessage::HotkeyError(format!(
+                "Failed to list audio input devices: {}",
+                e
+            )));
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+            return;
+        }
+    };
+    info!("Found {} audio input devices in thread.", available_input_devices.len()); // Log info
 
-    // 4. Event Loop
+    // 5. Win32 Message Loop combined with Hotkey/Shutdown Check
+    let mut msg = MSG::default();
     loop {
-        // Check for shutdown signal periodically using recv_timeout
-        match receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(event) => {
-                if event.state == HotKeyState::Pressed {
-                    let hotkey_id = event.id;
-                    if let Some(target_device_name) = hotkey_device_map.get(&hotkey_id) {
-                        println!(
-                            "Hotkey ID {} pressed, switching to '{}'",
-                            hotkey_id, target_device_name
-                        );
-                        match find_and_set_device(target_device_name, &available_devices, &config) {
-                            Ok(name) => println!("Successfully set device to {}", name),
-                            Err(e) => eprintln!("Failed to set device: {}", e), // Log error but continue
-                        }
-                    } else {
-                        eprintln!("Warning: Received event for unknown hotkey ID: {}", hotkey_id);
+        // Check for hotkey events first (non-blocking)
+        if let Ok(event) = receiver.try_recv() {
+            // println!("--- DEBUG: Received hotkey event: ID={}, State={:?}", event.id, event.state); // Remove debug print
+            if event.state == HotKeyState::Pressed {
+                let hotkey_id = event.id;
+                if let Some(mapping) = hotkey_device_map.get(&hotkey_id) {
+                    info!(
+                        // Log info
+                        "Hotkey ID {} pressed, switching to output: '{}', input: '{:?}'",
+                        hotkey_id, mapping.device_name, mapping.input_device_name
+                    );
+                    
+                    // Switch output device
+                    match find_and_set_output_device(&mapping.device_name, &available_output_devices, &config) {
+                        Ok(name) => info!("Successfully set output device to {}", name), // Log info
+                        Err(e) => error!("Failed to set output device: {}", e),          // Log error
                     }
+                    
+                    // Switch input device if specified
+                    if let Some(input_device_name) = &mapping.input_device_name {
+                        match find_and_set_input_device(input_device_name, &available_input_devices, &config) {
+                            Ok(name) => info!("Successfully set input device to {}", name), // Log info
+                            Err(e) => error!("Failed to set input device: {}", e),          // Log error
+                        }
+                    }
+                } else {
+                    warn!("Received event for unknown hotkey ID: {}", hotkey_id); // Log warning
                 }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Timeout is expected, check shutdown signal
-                if shutdown_signal.load(Ordering::Relaxed) {
-                    println!("Shutdown signal received in hotkey thread. Exiting loop.");
-                    break;
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!("Hotkey channel disconnected. Exiting thread.");
-                let _ = error_sender.send(AppMessage::HotkeyError(
-                    "Hotkey event channel disconnected".into(),
-                ));
-                break;
             }
         }
-         // Check shutdown signal again after processing an event or timeout
-         if shutdown_signal.load(Ordering::Relaxed) {
-            println!("Shutdown signal received in hotkey thread. Exiting loop.");
+
+        // Process Windows messages (crucial for global-hotkey)
+        // Use PeekMessageW for non-blocking check
+        let message_handled: BOOL = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) };
+        if message_handled.as_bool() {
+            // println!("--- DEBUG: Processing Windows message: {:?}", msg.message); // Optional: Very verbose
+            unsafe {
+                let _ = TranslateMessage(&msg); // Ignore result
+                DispatchMessageW(&msg);
+            }
+        }
+
+        // Check for shutdown signal
+        if shutdown_signal.load(Ordering::Relaxed) {
+            info!("Shutdown signal received in hotkey thread. Exiting loop."); // Log info
             break;
         }
+
+        // If no messages and no hotkey events, sleep briefly to avoid high CPU usage
+        if !message_handled.as_bool() && receiver.is_empty() {
+            thread::sleep(Duration::from_millis(10)); // Short sleep
+        }
     }
 
-    // Cleanup: Unregister hotkeys before the thread exits
-    println!("Unregistering all hotkeys...");
-    if let Err(e) = manager.unregister_all() {
-        eprintln!("Error unregistering hotkeys: {}", e);
-        // Send error back? Maybe not critical if we are quitting anyway.
-        let _ = error_sender.send(AppMessage::HotkeyError(Box::new(e)));
+    // Cleanup
+    info!("Unregistering all hotkeys..."); // Log info
+    if let Err(e) = manager.unregister_all(&hotkeys) {
+        error!("Error unregistering hotkeys: {}", e); // Log error
+        let _ = error_sender.send(AppMessage::HotkeyError(format!(
+            "Failed to unregister hotkeys: {}",
+            e
+        )));
     } else {
-        println!("Hotkeys unregistered successfully.");
+        info!("Hotkeys unregistered successfully."); // Log info
     }
 
-    println!("Hotkey listener thread finished.");
+    // Uninitialize COM for this thread
+    unsafe { windows::Win32::System::Com::CoUninitialize() };
+    info!("Hotkey thread COM uninitialized."); // Log info
+
+    info!("Hotkey listener thread finished."); // Log info
 }
 
-// Helper function to find and set the audio device
-fn find_and_set_device(
+// Helper function to find and set the audio output device
+fn find_and_set_output_device(
     target_device_name: &str,
     available_devices: &[AudioDevice],
     config: &Config,
 ) -> Result<String, Box<dyn Error>> {
+    // println!("--- DEBUG: Entering find_and_set_device for target '{}'", target_device_name); // Remove debug print
     let mut found_device_id: Option<String> = None;
     let mut found_device_name: Option<String> = None;
 
     if config.fuzzy_match {
+        // println!("--- DEBUG: Using fuzzy matching ---"); // Remove debug print
         // println!("Fuzzy matching enabled."); // Less verbose logging
         let matcher = SkimMatcherV2::default();
         let mut best_match: Option<(i64, &AudioDevice)> = None;
@@ -152,102 +232,317 @@ fn find_and_set_device(
         }
 
         if let Some((_score, device)) = best_match {
-            // println!("  Best fuzzy match: '{}' (Score: {})", device.name, score);
+            // Don't need score anymore
+            // println!("--- DEBUG: Best fuzzy match: '{}' (Score: {}) with ID '{}'", device.name, _score, device.id); // Remove debug print
             found_device_id = Some(device.id.clone());
             found_device_name = Some(device.name.clone());
         } else {
+            // println!("--- DEBUG: No fuzzy match found ---"); // Remove debug print
             return Err(format!("No fuzzy match found for '{}'", target_device_name).into());
         }
     } else {
-        // println!("Exact matching enabled."); // Less verbose logging
-        if let Some(device) = available_devices.iter().find(|d| &d.name == target_device_name) {
-            // println!("  Exact match found: '{}'", device.name);
+        // println!("--- DEBUG: Using exact matching ---"); // Remove debug print
+        if let Some(device) = available_devices
+            .iter()
+            .find(|d| &d.name == target_device_name)
+        {
+            // println!("--- DEBUG: Exact match found: '{}' with ID '{}'", device.name, device.id); // Remove debug print
             found_device_id = Some(device.id.clone());
             found_device_name = Some(device.name.clone());
         } else {
+            // println!("--- DEBUG: No exact match found ---"); // Remove debug print
             return Err(format!("No exact match found for '{}'", target_device_name).into());
         }
     }
 
-    if let Some(id_to_set) = found_device_id {
-        set_default_output_device(&id_to_set)?;
-        Ok(found_device_name.unwrap_or_else(|| id_to_set)) // Return name if found, else ID
+    if let Some(id_to_set) = &found_device_id {
+        // println!("--- DEBUG: Attempting to set default device to ID '{}'", id_to_set); // Remove debug print
+        set_default_output_device(id_to_set)?;
+        // println!("--- DEBUG: set_default_output_device succeeded ---"); // Remove debug print
+        Ok(found_device_name.unwrap_or_else(|| id_to_set.clone())) // Clone id_to_set if name is None
     } else {
         // This case should technically be handled by the Err returns above
+        // println!("--- DEBUG: Error - found_device_id was None unexpectedly ---"); // Remove debug print
         Err("Device ID was determined but somehow lost".into())
     }
 }
 
+// Helper function to find and set the audio input device
+fn find_and_set_input_device(
+    target_device_name: &str,
+    available_devices: &[AudioDevice],
+    config: &Config,
+) -> Result<String, Box<dyn Error>> {
+    let mut found_device_id: Option<String> = None;
+    let mut found_device_name: Option<String> = None;
 
-fn run_tray_app() -> Result<(), Box<dyn Error>> {
-    println!("Starting SoundSwitch with Tray Icon...");
+    if config.fuzzy_match {
+        let matcher = SkimMatcherV2::default();
+        let mut best_match: Option<(i64, &AudioDevice)> = None;
 
-    // 1. Load Configuration (needed for the hotkey thread)
-    let config = load_config().map_err(|e| {
-        eprintln!("Fatal: Error loading configuration: {}. Exiting.", e);
-        e
-    })?;
-    println!("Configuration loaded successfully.");
-     if config.hotkeys.is_empty() {
-        println!("Warning: No hotkeys defined in the configuration.");
+        for device in available_devices {
+            if let Some(score) = matcher.fuzzy_match(&device.name, target_device_name) {
+                if best_match.is_none() || score > best_match.unwrap().0 {
+                    best_match = Some((score, device));
+                }
+            }
+        }
+
+        if let Some((_score, device)) = best_match {
+            found_device_id = Some(device.id.clone());
+            found_device_name = Some(device.name.clone());
+        } else {
+            return Err(format!("No fuzzy match found for input device '{}'", target_device_name).into());
+        }
+    } else {
+        if let Some(device) = available_devices
+            .iter()
+            .find(|d| &d.name == target_device_name)
+        {
+            found_device_id = Some(device.id.clone());
+            found_device_name = Some(device.name.clone());
+        } else {
+            return Err(format!("No exact match found for input device '{}'", target_device_name).into());
+        }
     }
 
+    if let Some(id_to_set) = &found_device_id {
+        set_default_input_device(id_to_set)?;
+        Ok(found_device_name.unwrap_or_else(|| id_to_set.clone())) // Clone id_to_set if name is None
+    } else {
+        // This case should technically be handled by the Err returns above
+        Err("Input device ID was determined but somehow lost".into())
+    }
+}
 
-    // 2. Setup communication channels
+// Function to validate that configured devices exist on the system
+fn validate_configured_devices(config: &Config) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let mut missing_output_devices = Vec::new();
+    let mut missing_input_devices = Vec::new();
+
+    // Get available devices
+    let available_output_devices = match list_output_devices() {
+        Ok(devices) => devices,
+        Err(e) => {
+            error!("Failed to list output devices during validation: {}", e);
+            return (missing_output_devices, missing_input_devices, Vec::new(), Vec::new());
+        }
+    };
+
+    let available_input_devices = match list_input_devices() {
+        Ok(devices) => devices,
+        Err(e) => {
+            error!("Failed to list input devices during validation: {}", e);
+            return (missing_output_devices, missing_input_devices, Vec::new(), Vec::new());
+        }
+    };
+
+    // Create lists of available device names for the notification
+    let available_output_names: Vec<String> = available_output_devices.iter().map(|d| d.name.clone()).collect();
+    let available_input_names: Vec<String> = available_input_devices.iter().map(|d| d.name.clone()).collect();
+
+    // Check each configured hotkey mapping
+    for mapping in &config.hotkeys {
+        // Check output device
+        let output_found = if config.fuzzy_match {
+            let matcher = SkimMatcherV2::default();
+            available_output_devices.iter().any(|device| {
+                matcher.fuzzy_match(&device.name, &mapping.device_name).is_some()
+            })
+        } else {
+            available_output_devices.iter().any(|device| device.name == mapping.device_name)
+        };
+
+        if !output_found {
+            let entry = format!("{} (hotkey: {})", mapping.device_name, mapping.keys);
+            missing_output_devices.push(entry.clone());
+            warn!("Output device not found: {}", entry);
+        }
+
+        // Check input device if specified
+        if let Some(input_device_name) = &mapping.input_device_name {
+            let input_found = if config.fuzzy_match {
+                let matcher = SkimMatcherV2::default();
+                available_input_devices.iter().any(|device| {
+                    matcher.fuzzy_match(&device.name, input_device_name).is_some()
+                })
+            } else {
+                available_input_devices.iter().any(|device| device.name == *input_device_name)
+            };
+
+            if !input_found {
+                let entry = format!("{} (hotkey: {})", input_device_name, mapping.keys);
+                missing_input_devices.push(entry.clone());
+                warn!("Input device not found: {}", entry);
+            }
+        }
+    }
+
+    (missing_output_devices, missing_input_devices, available_output_names, available_input_names)
+}
+
+// Function to show a Windows notification for missing devices
+fn show_missing_devices_notification(
+    missing_output: &[String], 
+    missing_input: &[String], 
+    available_output: &[String], 
+    available_input: &[String]
+) {
+    if missing_output.is_empty() && missing_input.is_empty() {
+        return; // Nothing to show
+    }
+
+    let mut message = String::from("SoundSwitch has started but some configured devices were not found:\n\n");
+
+    if !missing_output.is_empty() {
+        message.push_str(&format!("Missing Output Device{} ({}):\n", 
+            if missing_output.len() > 1 { "s" } else { "" },
+            missing_output.len()));
+        for device in missing_output {
+            message.push_str(&format!("  • {}\n", device));
+        }
+        message.push('\n');
+    }
+
+    if !missing_input.is_empty() {
+        message.push_str(&format!("Missing Input Device{} ({}):\n", 
+            if missing_input.len() > 1 { "s" } else { "" },
+            missing_input.len()));
+        for device in missing_input {
+            message.push_str(&format!("  • {}\n", device));
+        }
+        message.push('\n');
+    }
+
+    message.push_str("The application will continue to run, but these hotkeys will not work until the devices are available.\n\n");
+
+    // Add available devices list to help with configuration
+    if !missing_output.is_empty() && !available_output.is_empty() {
+        message.push_str(&format!("Available Output Devices ({}):\n", available_output.len()));
+        for device in available_output {
+            message.push_str(&format!("  • {}\n", device));
+        }
+        message.push('\n');
+    }
+
+    if !missing_input.is_empty() && !available_input.is_empty() {
+        message.push_str(&format!("Available Input Devices ({}):\n", available_input.len()));
+        for device in available_input {
+            message.push_str(&format!("  • {}\n", device));
+        }
+        message.push('\n');
+    }
+
+    message.push_str("Possible solutions:\n");
+    message.push_str("• Check that the devices are connected and enabled in Windows Sound settings\n");
+    message.push_str("• Verify the device names in your config.toml file match the available devices above\n");
+    message.push_str("• Consider enabling fuzzy matching in your configuration");
+
+    // Show Windows MessageBox
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK, MessageBoxW};
+    use windows::core::HSTRING;
+
+    let title = HSTRING::from("SoundSwitch - Missing Audio Devices");
+    let content = HSTRING::from(message);
+
+    unsafe {
+        MessageBoxW(
+            None,
+            &content,
+            &title,
+            MB_OK | MB_ICONWARNING,
+        );
+    }
+}
+
+fn run_tray_app() -> Result<(), Box<dyn Error>> {
+    info!("Starting SoundSwitch with Tray Icon..."); // Log info
+
+    // 1. Load Configuration (needed for the hotkey thread)
+    let config = match load_config() {
+        Ok(cfg) => {
+            info!("Configuration loaded successfully."); // Log info
+            if cfg.hotkeys.is_empty() {
+                warn!("No hotkeys defined in the configuration."); // Log warning
+            }
+            cfg // Return the loaded config
+        }
+        Err(e) => {
+            // Print the specific config error and return it to exit run_tray_app
+            error!("!!! Fatal: Error loading configuration: {} !!!", e); // Log error
+            return Err(e); // Propagate the error
+        }
+    };
+    // If we reach here, config loaded successfully.
+
+    // 1.5. Validate configured devices and show notification if any are missing
+    info!("Validating configured devices..."); // Log info
+    let (missing_output, missing_input, available_output, available_input) = validate_configured_devices(&config);
+    if !missing_output.is_empty() || !missing_input.is_empty() {
+        warn!(
+            "Missing devices found - Output: {:?}, Input: {:?}",
+            missing_output, missing_input
+        ); // Log warning
+        show_missing_devices_notification(&missing_output, &missing_input, &available_output, &available_input);
+    } else {
+        info!("All configured devices found."); // Log info
+    }
+
+    // 2. Setup communication channels (Restore)
     let shutdown_signal = Arc::new(AtomicBool::new(false));
-    let (error_sender, error_receiver): (
-        std::sync::mpsc::Sender<AppMessage>,
-        MpscReceiver<AppMessage>, // Use renamed type
-    ) = channel();
+    let (error_sender, error_receiver) = crossbeam_channel::unbounded::<AppMessage>();
 
-    // 3. Spawn Hotkey Listener Thread
+    // 3. Spawn Hotkey Listener Thread (Restore)
     let shutdown_signal_clone = Arc::clone(&shutdown_signal);
     let error_sender_clone = error_sender.clone(); // Clone sender for the thread
     let config_clone = config.clone(); // Clone config for the thread
 
     let hotkey_thread_handle = thread::spawn(move || {
-        hotkey_listener_thread(config_clone, shutdown_signal_clone, error_sender_clone);
+        hotkey_listener_thread(config_clone, shutdown_signal_clone, error_sender_clone)
     });
-    println!("Hotkey listener thread spawned.");
+    info!("Hotkey listener thread spawned."); // Log info
 
-
-    // 4. Setup Tray Icon
+    // 4. Setup Tray Icon (Restore)
     // Use a simple placeholder icon name for now.
     // For a real icon, you'd load it from a file (e.g., .ico on Windows)
     // using `tray.set_icon(Icon::from_path("path/to/icon.ico")?)`
-    let mut tray = TrayItem::new("SoundSwitch", tray_item::IconSource::Resource("default-icon"))?;
-    println!("Tray icon created.");
+    let mut tray = TrayItem::new(
+        "SoundSwitch",
+        tray_item::IconSource::Resource("default-icon"),
+    )
+    .map_err(|e| format!("Failed to create tray icon: {}", e))?;
+    info!("Tray icon created."); // Log info
 
     // Add Quit menu item
-    let quit_sender = error_sender.clone(); // Clone sender for the quit callback
+    // Use the error_sender (renamed quit_sender) for the Quit message
+    let quit_sender = error_sender.clone();
     tray.add_menu_item("Quit", move || {
-        println!("Quit menu item selected.");
+        info!("Quit menu item selected."); // Log info
         // Send a Quit message to the main loop to initiate shutdown
         let _ = quit_sender.send(AppMessage::Quit);
-    })?;
-    println!("'Quit' menu item added.");
+    })
+    .map_err(|e| format!("Failed to add 'Quit' menu item: {}", e))?;
+    info!("'Quit' menu item added."); // Log info
 
-
-    // 5. Main Event Loop (Handling Tray Events and Messages)
-    println!("Main thread entering event loop (polling for messages)...");
+    // 5. Main Event Loop (Handling Tray Events and Messages from hotkey thread)
+    info!("Main thread entering event loop (polling for messages)..."); // Log info
     loop {
         // Check for messages from the hotkey thread or quit callback
         match error_receiver.try_recv() {
             Ok(AppMessage::HotkeyError(err)) => {
-                // Log the error. Could potentially show a notification.
-                eprintln!("Error received from hotkey thread: {}", err);
+                // Log the error string. Could potentially show a notification.
+                error!("Error received from hotkey thread: {}", err); // Log error
                 // Decide if the app should quit on certain errors. For now, just log.
-                // If it was a critical init error, the thread might have already stopped.
             }
             Ok(AppMessage::Quit) => {
-                println!("Quit message received. Initiating shutdown...");
+                info!("Quit message received. Initiating shutdown..."); // Log info
                 break; // Exit the main loop to start shutdown
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
+            Err(crossbeam_channel::TryRecvError::Empty) => {
                 // No message, continue polling
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                eprintln!("Error: Communication channel disconnected unexpectedly. Exiting.");
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                error!("Communication channel disconnected unexpectedly. Exiting."); // Log error
                 // Signal shutdown just in case the hotkey thread is still running somehow
                 shutdown_signal.store(true, Ordering::Relaxed);
                 break; // Exit loop
@@ -255,45 +550,46 @@ fn run_tray_app() -> Result<(), Box<dyn Error>> {
         }
 
         // Add a small sleep to prevent the loop from spinning excessively
-        // Note: tray-item doesn't seem to have its own blocking event loop,
-        // so we poll. Adjust sleep duration as needed.
         thread::sleep(Duration::from_millis(100));
 
-        // Check if the hotkey thread has panicked or exited unexpectedly
-        if hotkey_thread_handle.is_finished() {
-             eprintln!("Warning: Hotkey listener thread has finished unexpectedly.");
-             // Attempt to join to get potential panic message (might block)
-             match hotkey_thread_handle.join() {
-                 Ok(_) => eprintln!("Hotkey thread joined cleanly after finishing early."),
-                 Err(e) => eprintln!("Hotkey thread panicked: {:?}", e),
-             }
-             // Decide whether to exit the main app here. Let's exit for safety.
-             shutdown_signal.store(true, Ordering::Relaxed); // Ensure signal is set
-             break;
+        // Check if shutdown was requested via Quit menu
+        // This check is technically redundant now as the Quit match arm breaks the loop,
+        // but keep it for clarity or if other shutdown mechanisms are added.
+        if shutdown_signal.load(Ordering::Relaxed) {
+            warn!("Shutdown signal detected in main loop."); // Log warning (Should not happen if Quit breaks loop)
+            break;
         }
     }
 
-    // 6. Shutdown Sequence
-    println!("Starting shutdown sequence...");
+    // 6. Shutdown Sequence (Restore original logic)
+    info!("Starting shutdown sequence..."); // Log info
 
     // Signal the hotkey thread to stop
-    println!("Setting shutdown signal for hotkey thread...");
+    info!("Setting shutdown signal for hotkey thread..."); // Log info
     shutdown_signal.store(true, Ordering::Relaxed);
 
     // Wait for the hotkey thread to finish
-    println!("Waiting for hotkey thread to join...");
-    // Re-acquire handle if it was moved in the is_finished check (it wasn't)
+    info!("Waiting for hotkey thread to join..."); // Log info
     match hotkey_thread_handle.join() {
-        Ok(_) => println!("Hotkey thread joined successfully."),
-        Err(e) => eprintln!("Error joining hotkey thread (it might have panicked): {:?}", e),
+        Ok(_) => info!("Hotkey thread joined successfully."), // Log info
+        Err(e) => error!(
+            "Error joining hotkey thread (it might have panicked): {:?}",
+            e
+        ), // Log error
     }
 
-    println!("SoundSwitch application finished.");
+    info!("SoundSwitch application finished."); // Log info
+    // println!("--- EXITING run_tray_app (Ok) ---"); // Removed debug print
     Ok(())
 }
 
-
 fn main() {
+    let _logger = WriteLogger::init(
+        LevelFilter::Info,
+        ConfigBuilder::new().build(),
+        File::create("sound_switch.log").unwrap(), // Create log file
+    )
+    .unwrap();
     // Use run_tray_app instead of run_app
     if let Err(e) = run_tray_app() {
         // Using eprintln might not be visible if the console is hidden.
@@ -302,11 +598,16 @@ fn main() {
         // For now, just print to stderr, which might go nowhere in release.
         // A message box could be used here for critical errors.
         // Example (requires enabling UI features in windows-rs):
-        // use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONERROR};
-        // use windows::core::w;
-        // unsafe {
-        //     MessageBoxW(None, w!("Application exited with error."), w!("SoundSwitch Error"), MB_OK | MB_ICONERROR);
-        // }
+        use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+        use windows::core::w;
+        unsafe {
+            MessageBoxW(
+                None,
+                w!("Application exited with error."),
+                w!("SoundSwitch Error"),
+                MB_OK | MB_ICONERROR,
+            );
+        }
         std::process::exit(1);
     }
 }
