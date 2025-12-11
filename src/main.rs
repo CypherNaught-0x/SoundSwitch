@@ -18,7 +18,7 @@ mod config;
 mod hotkey_manager;
 
 use audio_device::{AudioDevice, list_output_devices, list_input_devices, set_default_output_device, set_default_input_device};
-use config::{Config, load_config}; // Import Config struct
+use config::{Config, FuzzyMatchAlgorithm, load_config}; // Import Config struct and FuzzyMatchAlgorithm
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState}; // Corrected import name
@@ -207,63 +207,104 @@ fn hotkey_listener_thread(
     info!("Hotkey listener thread finished."); // Log info
 }
 
+// Helper function to find the best matching device using the configured fuzzy match algorithm
+fn find_best_match<'a>(
+    target_name: &str,
+    available_devices: &'a [AudioDevice],
+    config: &Config,
+) -> Option<&'a AudioDevice> {
+    info!(
+        "find_best_match called: target='{}', fuzzy_match={}, algorithm={:?}, threshold={}",
+        target_name, config.fuzzy_match, config.fuzzy_match_algorithm, config.fuzzy_match_threshold
+    );
+
+    if !config.fuzzy_match {
+        // Exact match mode
+        info!("Using exact match mode");
+        return available_devices.iter().find(|d| d.name == target_name);
+    }
+
+    // Fuzzy match mode - use the configured algorithm
+    info!("Using fuzzy match mode with {:?} algorithm", config.fuzzy_match_algorithm);
+    match config.fuzzy_match_algorithm {
+        FuzzyMatchAlgorithm::Skim => {
+            let matcher = SkimMatcherV2::default();
+            let mut best_match: Option<(i64, &AudioDevice)> = None;
+
+            for device in available_devices {
+                if let Some(score) = matcher.fuzzy_match(&device.name, target_name) {
+                    if best_match.is_none() || score > best_match.unwrap().0 {
+                        best_match = Some((score, device));
+                    }
+                }
+            }
+
+            best_match.map(|(_score, device)| device)
+        }
+        FuzzyMatchAlgorithm::Levenshtein => {
+            // Use normalized Levenshtein distance (0.0 = completely different, 1.0 = identical)
+            // Lower distance is better, so we look for the minimum distance
+            let mut best_match: Option<(f64, &AudioDevice)> = None;
+
+            for device in available_devices {
+                // Normalize both strings to lowercase for case-insensitive comparison
+                let device_name_lower = device.name.to_lowercase();
+                let target_name_lower = target_name.to_lowercase();
+
+                // Calculate normalized Levenshtein similarity (1.0 = identical, 0.0 = completely different)
+                let similarity = strsim::normalized_levenshtein(&device_name_lower, &target_name_lower);
+
+                info!(
+                    "Levenshtein similarity: '{}' vs '{}' = {:.3}",
+                    device.name, target_name, similarity
+                );
+
+                // Keep the device with highest similarity
+                if best_match.is_none() || similarity > best_match.unwrap().0 {
+                    best_match = Some((similarity, device));
+                }
+            }
+
+            // Use the configurable threshold from config
+            let threshold = config.fuzzy_match_threshold;
+            best_match.and_then(|(similarity, device)| {
+                if similarity >= threshold {
+                    info!(
+                        "Best match found: '{}' with similarity {:.3} (threshold: {:.3})",
+                        device.name, similarity, threshold
+                    );
+                    Some(device)
+                } else {
+                    warn!(
+                        "Best candidate '{}' has similarity {:.3} below threshold {:.3}",
+                        device.name, similarity, threshold
+                    );
+                    None
+                }
+            })
+        }
+    }
+}
+
 // Helper function to find and set the audio output device
 fn find_and_set_output_device(
     target_device_name: &str,
     available_devices: &[AudioDevice],
     config: &Config,
 ) -> Result<String, Box<dyn Error>> {
-    // println!("--- DEBUG: Entering find_and_set_device for target '{}'", target_device_name); // Remove debug print
-    let mut found_device_id: Option<String> = None;
-    let mut found_device_name: Option<String> = None;
-
-    if config.fuzzy_match {
-        // println!("--- DEBUG: Using fuzzy matching ---"); // Remove debug print
-        // println!("Fuzzy matching enabled."); // Less verbose logging
-        let matcher = SkimMatcherV2::default();
-        let mut best_match: Option<(i64, &AudioDevice)> = None;
-
-        for device in available_devices {
-            if let Some(score) = matcher.fuzzy_match(&device.name, target_device_name) {
-                if best_match.is_none() || score > best_match.unwrap().0 {
-                    best_match = Some((score, device));
-                }
-            }
+    match find_best_match(target_device_name, available_devices, config) {
+        Some(device) => {
+            set_default_output_device(&device.id)?;
+            Ok(device.name.clone())
         }
-
-        if let Some((_score, device)) = best_match {
-            // Don't need score anymore
-            // println!("--- DEBUG: Best fuzzy match: '{}' (Score: {}) with ID '{}'", device.name, _score, device.id); // Remove debug print
-            found_device_id = Some(device.id.clone());
-            found_device_name = Some(device.name.clone());
-        } else {
-            // println!("--- DEBUG: No fuzzy match found ---"); // Remove debug print
-            return Err(format!("No fuzzy match found for '{}'", target_device_name).into());
+        None => {
+            let match_type = if config.fuzzy_match {
+                format!("{:?} fuzzy match", config.fuzzy_match_algorithm)
+            } else {
+                "exact match".to_string()
+            };
+            Err(format!("No {} found for output device '{}'", match_type, target_device_name).into())
         }
-    } else {
-        // println!("--- DEBUG: Using exact matching ---"); // Remove debug print
-        if let Some(device) = available_devices
-            .iter()
-            .find(|d| &d.name == target_device_name)
-        {
-            // println!("--- DEBUG: Exact match found: '{}' with ID '{}'", device.name, device.id); // Remove debug print
-            found_device_id = Some(device.id.clone());
-            found_device_name = Some(device.name.clone());
-        } else {
-            // println!("--- DEBUG: No exact match found ---"); // Remove debug print
-            return Err(format!("No exact match found for '{}'", target_device_name).into());
-        }
-    }
-
-    if let Some(id_to_set) = &found_device_id {
-        // println!("--- DEBUG: Attempting to set default device to ID '{}'", id_to_set); // Remove debug print
-        set_default_output_device(id_to_set)?;
-        // println!("--- DEBUG: set_default_output_device succeeded ---"); // Remove debug print
-        Ok(found_device_name.unwrap_or_else(|| id_to_set.clone())) // Clone id_to_set if name is None
-    } else {
-        // This case should technically be handled by the Err returns above
-        // println!("--- DEBUG: Error - found_device_id was None unexpectedly ---"); // Remove debug print
-        Err("Device ID was determined but somehow lost".into())
     }
 }
 
@@ -273,45 +314,19 @@ fn find_and_set_input_device(
     available_devices: &[AudioDevice],
     config: &Config,
 ) -> Result<String, Box<dyn Error>> {
-    let mut found_device_id: Option<String> = None;
-    let mut found_device_name: Option<String> = None;
-
-    if config.fuzzy_match {
-        let matcher = SkimMatcherV2::default();
-        let mut best_match: Option<(i64, &AudioDevice)> = None;
-
-        for device in available_devices {
-            if let Some(score) = matcher.fuzzy_match(&device.name, target_device_name) {
-                if best_match.is_none() || score > best_match.unwrap().0 {
-                    best_match = Some((score, device));
-                }
-            }
+    match find_best_match(target_device_name, available_devices, config) {
+        Some(device) => {
+            set_default_input_device(&device.id)?;
+            Ok(device.name.clone())
         }
-
-        if let Some((_score, device)) = best_match {
-            found_device_id = Some(device.id.clone());
-            found_device_name = Some(device.name.clone());
-        } else {
-            return Err(format!("No fuzzy match found for input device '{}'", target_device_name).into());
+        None => {
+            let match_type = if config.fuzzy_match {
+                format!("{:?} fuzzy match", config.fuzzy_match_algorithm)
+            } else {
+                "exact match".to_string()
+            };
+            Err(format!("No {} found for input device '{}'", match_type, target_device_name).into())
         }
-    } else {
-        if let Some(device) = available_devices
-            .iter()
-            .find(|d| &d.name == target_device_name)
-        {
-            found_device_id = Some(device.id.clone());
-            found_device_name = Some(device.name.clone());
-        } else {
-            return Err(format!("No exact match found for input device '{}'", target_device_name).into());
-        }
-    }
-
-    if let Some(id_to_set) = &found_device_id {
-        set_default_input_device(id_to_set)?;
-        Ok(found_device_name.unwrap_or_else(|| id_to_set.clone())) // Clone id_to_set if name is None
-    } else {
-        // This case should technically be handled by the Err returns above
-        Err("Input device ID was determined but somehow lost".into())
     }
 }
 
@@ -343,17 +358,8 @@ fn validate_configured_devices(config: &Config) -> (Vec<String>, Vec<String>, Ve
 
     // Check each configured hotkey mapping
     for mapping in &config.hotkeys {
-        // Check output device
-        let output_found = if config.fuzzy_match {
-            let matcher = SkimMatcherV2::default();
-            available_output_devices.iter().any(|device| {
-                matcher.fuzzy_match(&device.name, &mapping.device_name).is_some()
-            })
-        } else {
-            available_output_devices.iter().any(|device| device.name == mapping.device_name)
-        };
-
-        if !output_found {
+        // Check output device using the unified matching logic
+        if find_best_match(&mapping.device_name, &available_output_devices, config).is_none() {
             let entry = format!("{} (hotkey: {})", mapping.device_name, mapping.keys);
             missing_output_devices.push(entry.clone());
             warn!("Output device not found: {}", entry);
@@ -361,16 +367,7 @@ fn validate_configured_devices(config: &Config) -> (Vec<String>, Vec<String>, Ve
 
         // Check input device if specified
         if let Some(input_device_name) = &mapping.input_device_name {
-            let input_found = if config.fuzzy_match {
-                let matcher = SkimMatcherV2::default();
-                available_input_devices.iter().any(|device| {
-                    matcher.fuzzy_match(&device.name, input_device_name).is_some()
-                })
-            } else {
-                available_input_devices.iter().any(|device| device.name == *input_device_name)
-            };
-
-            if !input_found {
+            if find_best_match(input_device_name, &available_input_devices, config).is_none() {
                 let entry = format!("{} (hotkey: {})", input_device_name, mapping.keys);
                 missing_input_devices.push(entry.clone());
                 warn!("Input device not found: {}", entry);

@@ -21,13 +21,34 @@ pub struct HotkeyMapping {
     pub input_device_name: Option<String>,
 }
 
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FuzzyMatchAlgorithm {
+    Skim,
+    Levenshtein,
+}
+
+impl Default for FuzzyMatchAlgorithm {
+    fn default() -> Self {
+        FuzzyMatchAlgorithm::Skim
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
     #[serde(default)] // Defaults to false if not present
     pub fuzzy_match: bool,
+    #[serde(default)] // Defaults to Skim if not present
+    pub fuzzy_match_algorithm: FuzzyMatchAlgorithm,
+    #[serde(default = "default_fuzzy_match_threshold")] // Defaults to 0.3
+    pub fuzzy_match_threshold: f64,
     #[serde(default)] // Defaults to an empty vec if not present
     pub hotkeys: Vec<HotkeyMapping>,
+}
+
+fn default_fuzzy_match_threshold() -> f64 {
+    0.8 // More strict default threshold - requires 80% similarity
 }
 
 /// Loads configuration from `config.toml`.

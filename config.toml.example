@@ -1,5 +1,22 @@
 # Set to true to enable fuzzy matching for device names, false for exact matching.
-fuzzy_match = true
+fuzzy-match = true
+
+# Fuzzy matching algorithm to use when fuzzy-match is enabled.
+# Options:
+#   - "skim" (default): Fast fuzzy matching optimized for interactive search
+#   - "levenshtein": String similarity based on Levenshtein distance, better for handling
+#                    device name variations like "Headset (2)" vs "Headset (3)"
+# Note: This setting is ignored when fuzzy-match is false.
+fuzzy-match-algorithm = "levenshtein"
+
+# Fuzzy match threshold for the Levenshtein algorithm (0.0 to 1.0).
+# - 1.0 = exact match required
+# - 0.8 (default) = strict, requires 80% similarity (good for minor variations)
+# - 0.5 = moderate, allows device names with ~50% difference
+# - 0.3 = permissive, allows device names with ~70% difference
+# Lower values are more permissive. Adjust based on your device name variations.
+# Note: Only used when fuzzy-match-algorithm is "levenshtein".
+fuzzy-match-threshold = 0.8
 
 # Define your hotkey mappings here.
 # 'keys' uses a format like "Modifier+Modifier+Key" (e.g., "Ctrl+Shift+F1", "Alt+1").

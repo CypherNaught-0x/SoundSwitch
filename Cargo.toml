@@ -17,7 +17,8 @@ windows = { version = "0.61.1", features = [
     "Win32_System_Com_StructuredStorage", # For PropVariantClear
 ]} # Windows API bindings
 global-hotkey = "0.6.4" # Global hotkey registration
-fuzzy-matcher = "0.3" # Fuzzy string matching
+fuzzy-matcher = "0.3" # Fuzzy string matching (Skim algorithm)
+strsim = "0.11" # String similarity metrics (Levenshtein distance)
 tray-item = "0.10.0" # System tray icon
 windows-core = "0.61.0"
 crossbeam-channel = "0.5.15"

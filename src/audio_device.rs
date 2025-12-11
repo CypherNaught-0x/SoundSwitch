@@ -287,10 +287,11 @@ pub fn set_default_input_device(
     let escaped_module_path = module_path_str.replace('\'', "''");
     // --- End get path ---
 
-    // Construct the PowerShell command: Import using full path, then run Set-AudioDevice with -RecordingDevice flag
+    // Construct the PowerShell command: Import using full path, then run Set-AudioDevice
+    // Note: AudioDeviceCmdlets automatically detects device type from ID, no -RecordingDevice flag needed
     let command_str = format!(
         // Use single quotes around the path in PowerShell
-        "Import-Module -Name '{}' -ErrorAction Stop; Set-AudioDevice -ID '{}' -RecordingDevice",
+        "Import-Module -Name '{}' -ErrorAction Stop; Set-AudioDevice -ID '{}'",
         escaped_module_path,
         escaped_device_id
     );
